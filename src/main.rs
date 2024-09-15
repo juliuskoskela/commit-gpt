@@ -2,13 +2,16 @@ use std::fs;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use reqwest::blocking::Client;
-use git2::{Repository, DiffOptions, DiffLine, Delta, ErrorCode};
+use git2::{Repository, DiffOptions, DiffLine, Delta};
 use std::collections::HashMap;
+use thiserror::Error;
 
 const OPENAI_API_URL: &str = "https://api.openai.com/v1/chat/completions";
 const SYSTEM_PROMPT: &str = "You are a helpful assistant that writes clear and concise Git commit messages in the imperative mood, without any speculation.";
 const USER_PROMPT_TEMPLATE: &str = "\
-Write a Git commit message with a short title and a detailed body, using the imperative mood. Do not include any speculation or guesses. Be concise and precise. Use bullet points in the body to list changes.
+Write a Git commit message with a short title and a detailed body, using the imperative mood. Do not include any speculation or guesses. Be concise and precise. Use bullet points in the body to list changes. Format the message as a git commit message with no extra metadata, symbols or quotes in a way that it can be directly copy pasted to the commit.
+
+Context: {context}
 
 Changes:
 {structured_changes}
@@ -32,6 +35,10 @@ struct Args {
     /// OpenAI model to use (defaults to gpt-4)
     #[arg(short, long, value_name = "MODEL", default_value = "gpt-4")]
     model: String,
+
+    /// Include unstaged changes (default is false)
+    #[arg(short = 'u', long)]
+    include_unstaged: bool,
 }
 
 #[derive(Serialize)]
@@ -67,39 +74,65 @@ struct FileChange {
     summaries: Vec<String>,
 }
 
+#[derive(Error, Debug)]
+enum CommitGPTError {
+    #[error("Failed to read API key from {0}: {1}")]
+    ApiKeyReadError(String, #[source] std::io::Error),
+
+    #[error("Git error: {0}")]
+    GitError(#[from] git2::Error),
+
+    #[error("HTTP request error: {0}")]
+    HttpRequestError(#[from] reqwest::Error),
+
+    #[error("API responded with error status: {0}")]
+    ApiErrorStatus(reqwest::StatusCode),
+
+    #[error("Failed to parse API response: {0}")]
+    ApiResponseParseError(#[from] serde_json::Error),
+
+    #[error("No commit message generated")]
+    NoCommitMessage,
+}
+
+type Result<T> = std::result::Result<T, CommitGPTError>;
+
 fn main() {
+    if let Err(e) = run() {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
     // Parse command-line arguments
     let args = Args::parse();
 
     // Read the API key
-    let api_key = match fs::read_to_string(&args.api_key_path) {
-        Ok(key) => key.trim().to_string(),
-        Err(e) => {
-            eprintln!("Failed to read API key from {}: {}", args.api_key_path, e);
-            std::process::exit(1);
-        }
-    };
+    let api_key = fs::read_to_string(&args.api_key_path)
+        .map_err(|e| CommitGPTError::ApiKeyReadError(args.api_key_path.clone(), e))?
+        .trim()
+        .to_string();
 
     // Open the Git repository at the specified working directory path
-    let repo = match Repository::open(&args.workdir_path) {
-        Ok(repo) => repo,
-        Err(e) => {
-            eprintln!(
-                "Failed to open Git repository at '{}': {}",
-                args.workdir_path, e
-            );
-            std::process::exit(1);
-        }
-    };
+    let repo = Repository::open(&args.workdir_path)?;
 
     // Prepare git information
-    let structured_changes = get_structured_changes(&repo);
+    let structured_changes = get_structured_changes(&repo, args.include_unstaged)?;
     if structured_changes.is_empty() {
-        println!("No changes detected. Nothing to generate a commit message for.");
-        std::process::exit(0);
+        if args.include_unstaged {
+            println!("No changes detected. Nothing to generate a commit message for.");
+        } else {
+            println!("No staged changes detected. Nothing to generate a commit message for.");
+        }
+        return Ok(());
     }
 
-    let prompt = USER_PROMPT_TEMPLATE.replace("{structured_changes}", &structured_changes);
+    let context = args.context.unwrap_or_default();
+
+    let prompt = USER_PROMPT_TEMPLATE
+        .replace("{structured_changes}", &structured_changes)
+        .replace("{context}", &context);
 
     // Prepare OpenAI API request
     let request_body = OpenAIRequest {
@@ -119,57 +152,69 @@ fn main() {
     // Create a client with rustls TLS backend
     let client = Client::builder()
         .use_rustls_tls()
-        .build()
-        .expect("Failed to build HTTP client");
+        .build()?;
 
     // Send request to OpenAI API
     let response = client
         .post(OPENAI_API_URL)
         .header("Authorization", format!("Bearer {}", api_key))
         .json(&request_body)
-        .send();
+        .send()?;
 
-    match response {
-        Ok(resp) => {
-            if resp.status().is_success() {
-                let resp_json: OpenAIResponse = resp.json().unwrap();
-                let commit_message = resp_json.choices[0].message.content.trim();
-                // Output the commit message without extra text
-                println!("{}", commit_message);
-            } else {
-                eprintln!(
-                    "Failed to generate commit message. API response status: {}",
-                    resp.status()
-                );
-                let resp_text = resp.text().unwrap_or_default();
-                eprintln!("Response body:\n{}", resp_text);
-            }
+    if response.status().is_success() {
+        let resp_json: OpenAIResponse = response.json()?;
+        let commit_message = resp_json
+            .choices
+            .get(0)
+            .ok_or(CommitGPTError::NoCommitMessage)?
+            .message
+            .content
+            .trim()
+            .to_string();
+        if commit_message.is_empty() {
+            return Err(CommitGPTError::NoCommitMessage);
         }
-        Err(e) => {
-            eprintln!("Error sending request to OpenAI API: {}", e);
-        }
-    }
-}
-
-fn get_structured_changes(repo: &Repository) -> String {
-    let diff = get_combined_diff(repo);
-    let changes = collect_changes(&diff);
-    format_changes_for_prompt(&changes)
-}
-
-fn get_combined_diff(repo: &Repository) -> git2::Diff {
-    let mut diff_opts = DiffOptions::new();
-    diff_opts
-        .include_untracked(true)
-        .recurse_untracked_dirs(true);
-
-    if is_initial_commit(repo) {
-        repo.diff_index_to_workdir(None, Some(&mut diff_opts))
-            .unwrap()
+        // Output the commit message without extra text
+        println!("{}", commit_message);
     } else {
-        let head = repo.head().unwrap().peel_to_tree().unwrap();
-        repo.diff_tree_to_workdir(Some(&head), Some(&mut diff_opts))
-            .unwrap()
+        return Err(CommitGPTError::ApiErrorStatus(response.status()));
+    }
+
+    Ok(())
+}
+
+fn get_structured_changes(repo: &Repository, include_unstaged: bool) -> Result<String> {
+    let diff = get_combined_diff(repo, include_unstaged)?;
+    let changes = collect_changes(&diff);
+    Ok(format_changes_for_prompt(&changes))
+}
+
+fn get_combined_diff(repo: &Repository, include_unstaged: bool) -> Result<git2::Diff> {
+    let mut diff_opts = DiffOptions::new();
+    if include_unstaged {
+        // Include both staged and unstaged changes
+        diff_opts
+            .include_untracked(true)
+            .recurse_untracked_dirs(true);
+    } else {
+        // Include only staged changes
+        diff_opts
+            .include_untracked(false)
+            .recurse_untracked_dirs(false);
+    }
+
+    // Get the HEAD tree
+    let head = repo.head()?.peel_to_tree()?;
+
+    if include_unstaged {
+        // Diff between HEAD tree and workdir (staged and unstaged changes)
+        Ok(repo.diff_tree_to_workdir(Some(&head), Some(&mut diff_opts))?)
+    } else {
+        // Get the index
+        let index = repo.index()?;
+
+        // Diff between HEAD tree and index (staged changes)
+        Ok(repo.diff_tree_to_index(Some(&head), Some(&index), Some(&mut diff_opts))?)
     }
 }
 
@@ -251,18 +296,4 @@ fn format_changes_for_prompt(changes: &[FileChange]) -> String {
     }
 
     formatted
-}
-
-fn is_initial_commit(repo: &Repository) -> bool {
-    match repo.head() {
-        Ok(_) => false,
-        Err(e) => {
-            if e.code() == ErrorCode::UnbornBranch {
-                true
-            } else {
-                eprintln!("Error checking HEAD: {}", e);
-                false
-            }
-        }
-    }
 }
